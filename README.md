@@ -267,7 +267,7 @@ Auto-remediation that disables access keys can cause outages if it fires on legi
 - [x] DynamoDB audit trail and dynamic allowlists
 - [x] Dry-run mode
 - [ ] Slack webhook integration
-- [ ] Step Functions workflow for multi-step incident response with analyst approval
+- [x] Step Functions workflow for multi-step incident response with analyst approval
 - [ ] Additional detection signals: `ConsoleLogin` without MFA, `AssumeRole` from unknown accounts, `PutBucketPolicy` making S3 public
 - [ ] Terraform module for full pipeline deployment
 - [ ] Unit tests for detection logic
