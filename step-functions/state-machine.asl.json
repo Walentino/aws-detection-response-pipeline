@@ -5,8 +5,14 @@
 
     "ExtractEventContext": {
       "Type": "Task",
-      "Resource": "${ExtractContextFunctionArn}",
+      "Resource": "arn:aws:lambda:us-east-1:457664479040:function:security-incident-workflow-handler",
       "Comment": "Parse the raw CloudTrail/EventBridge event into a clean context object and determine severity.",
+      "Parameters": {
+        "task": "extract_context",
+        "detail.$": "$.detail",
+        "detail-type.$": "$.detail-type",
+        "source.$": "$.source"
+      },
       "ResultPath": "$.context",
       "Next": "CheckAllowlist",
       "Catch": [{
@@ -18,8 +24,12 @@
 
     "CheckAllowlist": {
       "Type": "Task",
-      "Resource": "${CheckAllowlistFunctionArn}",
+      "Resource": "arn:aws:lambda:us-east-1:457664479040:function:security-incident-workflow-handler",
       "Comment": "Check IP, principal, and DynamoDB allowlists. Returns {allowed: true/false}.",
+      "Parameters": {
+        "task": "check_allowlist",
+        "context.$": "$.context"
+      },
       "ResultPath": "$.allowlistResult",
       "Next": "IsAllowlisted",
       "Catch": [{
@@ -42,9 +52,10 @@
 
     "LogAllowlistHit": {
       "Type": "Task",
-      "Resource": "${AuditLogFunctionArn}",
+      "Resource": "arn:aws:lambda:us-east-1:457664479040:function:security-incident-workflow-handler",
       "Comment": "Record that this event was allowlisted (for tuning visibility).",
       "Parameters": {
+        "task": "audit_log",
         "context.$": "$.context",
         "action": "allowlisted",
         "reason.$": "$.allowlistResult.reason"
@@ -72,11 +83,13 @@
           "States": {
             "SendAlertSNS_Medium": {
               "Type": "Task",
-              "Resource": "${SendAlertFunctionArn}",
+              "Resource": "arn:aws:lambda:us-east-1:457664479040:function:security-incident-workflow-handler",
               "Parameters": {
+                "task": "send_alert",
                 "context.$": "$.context",
                 "channel": "sns",
-                "severity": "MEDIUM"
+                "severity": "MEDIUM",
+                "message": "MEDIUM severity detection — alert only, no auto-remediation"
               },
               "End": true
             }
@@ -87,8 +100,9 @@
           "States": {
             "WriteAuditLog_Medium": {
               "Type": "Task",
-              "Resource": "${AuditLogFunctionArn}",
+              "Resource": "arn:aws:lambda:us-east-1:457664479040:function:security-incident-workflow-handler",
               "Parameters": {
+                "task": "audit_log",
                 "context.$": "$.context",
                 "action": "alert_only",
                 "reason": "MEDIUM severity — no auto-remediation"
@@ -103,9 +117,10 @@
 
     "ImmediateContainment": {
       "Type": "Task",
-      "Resource": "${ContainmentFunctionArn}",
-      "Comment": "Disable the access key and attach deny-all policy immediately. This is the speed-critical step — contain first, investigate later.",
+      "Resource": "arn:aws:lambda:us-east-1:457664479040:function:security-incident-workflow-handler",
+      "Comment": "Disable the access key and attach deny-all policy immediately.",
       "Parameters": {
+        "task": "containment",
         "context.$": "$.context",
         "actions": ["disable_key", "attach_deny_policy"]
       },
@@ -120,15 +135,16 @@
 
     "ContainmentFailed": {
       "Type": "Parallel",
-      "Comment": "If containment fails, alert with CRITICAL urgency so an analyst intervenes manually.",
+      "Comment": "If containment fails, alert with CRITICAL urgency.",
       "Branches": [
         {
           "StartAt": "AlertContainmentFailure",
           "States": {
             "AlertContainmentFailure": {
               "Type": "Task",
-              "Resource": "${SendAlertFunctionArn}",
+              "Resource": "arn:aws:lambda:us-east-1:457664479040:function:security-incident-workflow-handler",
               "Parameters": {
+                "task": "send_alert",
                 "context.$": "$.context",
                 "channel": "sns",
                 "severity": "CRITICAL",
@@ -143,11 +159,12 @@
           "States": {
             "LogContainmentFailure": {
               "Type": "Task",
-              "Resource": "${AuditLogFunctionArn}",
+              "Resource": "arn:aws:lambda:us-east-1:457664479040:function:security-incident-workflow-handler",
               "Parameters": {
+                "task": "audit_log",
                 "context.$": "$.context",
                 "action": "containment_failed",
-                "error.$": "$.error"
+                "reason": "Containment action threw an error"
               },
               "End": true
             }
@@ -159,15 +176,16 @@
 
     "PostContainmentParallel": {
       "Type": "Parallel",
-      "Comment": "After successful containment, do three things in parallel: alert, log, and request analyst approval.",
+      "Comment": "After successful containment, alert, log, and request analyst approval in parallel.",
       "Branches": [
         {
           "StartAt": "SendContainmentAlert",
           "States": {
             "SendContainmentAlert": {
               "Type": "Task",
-              "Resource": "${SendAlertFunctionArn}",
+              "Resource": "arn:aws:lambda:us-east-1:457664479040:function:security-incident-workflow-handler",
               "Parameters": {
+                "task": "send_alert",
                 "context.$": "$.context",
                 "containmentResult.$": "$.containmentResult",
                 "channel": "sns",
@@ -183,11 +201,12 @@
           "States": {
             "WriteContainmentAuditLog": {
               "Type": "Task",
-              "Resource": "${AuditLogFunctionArn}",
+              "Resource": "arn:aws:lambda:us-east-1:457664479040:function:security-incident-workflow-handler",
               "Parameters": {
+                "task": "audit_log",
                 "context.$": "$.context",
                 "action": "contained",
-                "containmentResult.$": "$.containmentResult"
+                "reason": "Immediate containment executed"
               },
               "End": true
             }
@@ -199,9 +218,9 @@
             "RequestAnalystApproval": {
               "Type": "Task",
               "Resource": "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
-              "Comment": "Send approval request to SQS with a task token. The analyst approval Lambda (triggered by API Gateway or a simple approval page) calls SendTaskSuccess/SendTaskFailure with the token to resume the workflow.",
+              "Comment": "Send approval request to SQS with a task token. Workflow pauses until analyst responds.",
               "Parameters": {
-                "QueueUrl": "${ApprovalQueueUrl}",
+                "QueueUrl": "https://sqs.us-east-1.amazonaws.com/457664479040/security-incident-approval",
                 "MessageBody": {
                   "taskToken.$": "$$.Task.Token",
                   "context.$": "$.context",
@@ -223,7 +242,7 @@
 
     "CheckApprovalDecision": {
       "Type": "Choice",
-      "Comment": "Route based on analyst decision. The approval result is in the third branch (index 2) of the parallel output.",
+      "Comment": "Route based on analyst decision.",
       "Choices": [{
         "Variable": "$.parallelResults[2].approvalResult.decision",
         "StringEquals": "approve",
@@ -234,9 +253,10 @@
 
     "PermanentRemediation": {
       "Type": "Task",
-      "Resource": "${PermanentRemediationFunctionArn}",
-      "Comment": "Analyst approved. Delete the access key permanently and remove the deny-all policy (user is already locked out via key deletion).",
+      "Resource": "arn:aws:lambda:us-east-1:457664479040:function:security-incident-workflow-handler",
+      "Comment": "Analyst approved. Delete the access key permanently.",
       "Parameters": {
+        "task": "permanent_remediation",
         "context.$": "$.context",
         "actions": ["delete_key", "remove_deny_policy"]
       },
@@ -251,9 +271,10 @@
 
     "RollbackContainment": {
       "Type": "Task",
-      "Resource": "${RollbackFunctionArn}",
-      "Comment": "Analyst denied (false positive). Re-enable the access key and remove the deny-all policy.",
+      "Resource": "arn:aws:lambda:us-east-1:457664479040:function:security-incident-workflow-handler",
+      "Comment": "Analyst denied (false positive). Re-enable the access key.",
       "Parameters": {
+        "task": "rollback",
         "context.$": "$.context",
         "actions": ["enable_key", "remove_deny_policy"]
       },
@@ -275,8 +296,9 @@
           "States": {
             "SendResolutionAlert": {
               "Type": "Task",
-              "Resource": "${SendAlertFunctionArn}",
+              "Resource": "arn:aws:lambda:us-east-1:457664479040:function:security-incident-workflow-handler",
               "Parameters": {
+                "task": "send_alert",
                 "context.$": "$.context",
                 "channel": "sns",
                 "severity": "INFO",
@@ -291,10 +313,12 @@
           "States": {
             "WriteFinalAuditLog": {
               "Type": "Task",
-              "Resource": "${AuditLogFunctionArn}",
+              "Resource": "arn:aws:lambda:us-east-1:457664479040:function:security-incident-workflow-handler",
               "Parameters": {
+                "task": "audit_log",
                 "context.$": "$.context",
-                "action": "resolved"
+                "action": "resolved",
+                "reason": "Incident workflow completed"
               },
               "End": true
             }
@@ -306,12 +330,13 @@
 
     "NotifyPipelineError": {
       "Type": "Task",
-      "Resource": "${SendAlertFunctionArn}",
+      "Resource": "arn:aws:lambda:us-east-1:457664479040:function:security-incident-workflow-handler",
       "Parameters": {
+        "task": "send_alert",
         "channel": "sns",
         "severity": "CRITICAL",
         "message": "Step Functions workflow failed — manual investigation required",
-        "error.$": "$.error"
+        "context.$": "$.context"
       },
       "End": true
     }
