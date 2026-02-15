@@ -1,0 +1,319 @@
+{
+  "Comment": "Compromised IAM Access Key — Incident Response Workflow. Orchestrates detection triage, immediate containment, analyst approval, and final resolution.",
+  "StartAt": "ExtractEventContext",
+  "States": {
+
+    "ExtractEventContext": {
+      "Type": "Task",
+      "Resource": "${ExtractContextFunctionArn}",
+      "Comment": "Parse the raw CloudTrail/EventBridge event into a clean context object and determine severity.",
+      "ResultPath": "$.context",
+      "Next": "CheckAllowlist",
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "ResultPath": "$.error",
+        "Next": "NotifyPipelineError"
+      }]
+    },
+
+    "CheckAllowlist": {
+      "Type": "Task",
+      "Resource": "${CheckAllowlistFunctionArn}",
+      "Comment": "Check IP, principal, and DynamoDB allowlists. Returns {allowed: true/false}.",
+      "ResultPath": "$.allowlistResult",
+      "Next": "IsAllowlisted",
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "ResultPath": "$.error",
+        "Next": "NotifyPipelineError"
+      }]
+    },
+
+    "IsAllowlisted": {
+      "Type": "Choice",
+      "Comment": "If the event source is allowlisted, log and exit. Otherwise proceed to containment.",
+      "Choices": [{
+        "Variable": "$.allowlistResult.allowed",
+        "BooleanEquals": true,
+        "Next": "LogAllowlistHit"
+      }],
+      "Default": "EvaluateSeverity"
+    },
+
+    "LogAllowlistHit": {
+      "Type": "Task",
+      "Resource": "${AuditLogFunctionArn}",
+      "Comment": "Record that this event was allowlisted (for tuning visibility).",
+      "Parameters": {
+        "context.$": "$.context",
+        "action": "allowlisted",
+        "reason.$": "$.allowlistResult.reason"
+      },
+      "End": true
+    },
+
+    "EvaluateSeverity": {
+      "Type": "Choice",
+      "Comment": "Route based on severity. HIGH gets immediate containment + approval flow. MEDIUM gets alert only.",
+      "Choices": [{
+        "Variable": "$.context.severity",
+        "StringEquals": "HIGH",
+        "Next": "ImmediateContainment"
+      }],
+      "Default": "AlertOnly"
+    },
+
+    "AlertOnly": {
+      "Type": "Parallel",
+      "Comment": "For MEDIUM severity: send alerts and log, but take no remediation action.",
+      "Branches": [
+        {
+          "StartAt": "SendAlertSNS_Medium",
+          "States": {
+            "SendAlertSNS_Medium": {
+              "Type": "Task",
+              "Resource": "${SendAlertFunctionArn}",
+              "Parameters": {
+                "context.$": "$.context",
+                "channel": "sns",
+                "severity": "MEDIUM"
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "WriteAuditLog_Medium",
+          "States": {
+            "WriteAuditLog_Medium": {
+              "Type": "Task",
+              "Resource": "${AuditLogFunctionArn}",
+              "Parameters": {
+                "context.$": "$.context",
+                "action": "alert_only",
+                "reason": "MEDIUM severity — no auto-remediation"
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "End": true
+    },
+
+    "ImmediateContainment": {
+      "Type": "Task",
+      "Resource": "${ContainmentFunctionArn}",
+      "Comment": "Disable the access key and attach deny-all policy immediately. This is the speed-critical step — contain first, investigate later.",
+      "Parameters": {
+        "context.$": "$.context",
+        "actions": ["disable_key", "attach_deny_policy"]
+      },
+      "ResultPath": "$.containmentResult",
+      "Next": "PostContainmentParallel",
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "ResultPath": "$.error",
+        "Next": "ContainmentFailed"
+      }]
+    },
+
+    "ContainmentFailed": {
+      "Type": "Parallel",
+      "Comment": "If containment fails, alert with CRITICAL urgency so an analyst intervenes manually.",
+      "Branches": [
+        {
+          "StartAt": "AlertContainmentFailure",
+          "States": {
+            "AlertContainmentFailure": {
+              "Type": "Task",
+              "Resource": "${SendAlertFunctionArn}",
+              "Parameters": {
+                "context.$": "$.context",
+                "channel": "sns",
+                "severity": "CRITICAL",
+                "message": "AUTO-CONTAINMENT FAILED — manual intervention required"
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "LogContainmentFailure",
+          "States": {
+            "LogContainmentFailure": {
+              "Type": "Task",
+              "Resource": "${AuditLogFunctionArn}",
+              "Parameters": {
+                "context.$": "$.context",
+                "action": "containment_failed",
+                "error.$": "$.error"
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "End": true
+    },
+
+    "PostContainmentParallel": {
+      "Type": "Parallel",
+      "Comment": "After successful containment, do three things in parallel: alert, log, and request analyst approval.",
+      "Branches": [
+        {
+          "StartAt": "SendContainmentAlert",
+          "States": {
+            "SendContainmentAlert": {
+              "Type": "Task",
+              "Resource": "${SendAlertFunctionArn}",
+              "Parameters": {
+                "context.$": "$.context",
+                "containmentResult.$": "$.containmentResult",
+                "channel": "sns",
+                "severity": "HIGH",
+                "message": "Access key contained. Awaiting analyst approval for permanent deletion."
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "WriteContainmentAuditLog",
+          "States": {
+            "WriteContainmentAuditLog": {
+              "Type": "Task",
+              "Resource": "${AuditLogFunctionArn}",
+              "Parameters": {
+                "context.$": "$.context",
+                "action": "contained",
+                "containmentResult.$": "$.containmentResult"
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "RequestAnalystApproval",
+          "States": {
+            "RequestAnalystApproval": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
+              "Comment": "Send approval request to SQS with a task token. The analyst approval Lambda (triggered by API Gateway or a simple approval page) calls SendTaskSuccess/SendTaskFailure with the token to resume the workflow.",
+              "Parameters": {
+                "QueueUrl": "${ApprovalQueueUrl}",
+                "MessageBody": {
+                  "taskToken.$": "$$.Task.Token",
+                  "context.$": "$.context",
+                  "containmentResult.$": "$.containmentResult",
+                  "message": "Access key has been disabled. Approve to permanently delete the key, or deny to re-enable it.",
+                  "requestedAt.$": "$$.State.EnteredTime"
+                }
+              },
+              "HeartbeatSeconds": 86400,
+              "ResultPath": "$.approvalResult",
+              "End": true
+            }
+          }
+        }
+      ],
+      "ResultPath": "$.parallelResults",
+      "Next": "CheckApprovalDecision"
+    },
+
+    "CheckApprovalDecision": {
+      "Type": "Choice",
+      "Comment": "Route based on analyst decision. The approval result is in the third branch (index 2) of the parallel output.",
+      "Choices": [{
+        "Variable": "$.parallelResults[2].approvalResult.decision",
+        "StringEquals": "approve",
+        "Next": "PermanentRemediation"
+      }],
+      "Default": "RollbackContainment"
+    },
+
+    "PermanentRemediation": {
+      "Type": "Task",
+      "Resource": "${PermanentRemediationFunctionArn}",
+      "Comment": "Analyst approved. Delete the access key permanently and remove the deny-all policy (user is already locked out via key deletion).",
+      "Parameters": {
+        "context.$": "$.context",
+        "actions": ["delete_key", "remove_deny_policy"]
+      },
+      "ResultPath": "$.remediationResult",
+      "Next": "FinalNotification",
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "ResultPath": "$.error",
+        "Next": "NotifyPipelineError"
+      }]
+    },
+
+    "RollbackContainment": {
+      "Type": "Task",
+      "Resource": "${RollbackFunctionArn}",
+      "Comment": "Analyst denied (false positive). Re-enable the access key and remove the deny-all policy.",
+      "Parameters": {
+        "context.$": "$.context",
+        "actions": ["enable_key", "remove_deny_policy"]
+      },
+      "ResultPath": "$.rollbackResult",
+      "Next": "FinalNotification",
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "ResultPath": "$.error",
+        "Next": "NotifyPipelineError"
+      }]
+    },
+
+    "FinalNotification": {
+      "Type": "Parallel",
+      "Comment": "Send resolution notification and write final audit record.",
+      "Branches": [
+        {
+          "StartAt": "SendResolutionAlert",
+          "States": {
+            "SendResolutionAlert": {
+              "Type": "Task",
+              "Resource": "${SendAlertFunctionArn}",
+              "Parameters": {
+                "context.$": "$.context",
+                "channel": "sns",
+                "severity": "INFO",
+                "message": "Incident resolved."
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "WriteFinalAuditLog",
+          "States": {
+            "WriteFinalAuditLog": {
+              "Type": "Task",
+              "Resource": "${AuditLogFunctionArn}",
+              "Parameters": {
+                "context.$": "$.context",
+                "action": "resolved"
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "End": true
+    },
+
+    "NotifyPipelineError": {
+      "Type": "Task",
+      "Resource": "${SendAlertFunctionArn}",
+      "Parameters": {
+        "channel": "sns",
+        "severity": "CRITICAL",
+        "message": "Step Functions workflow failed — manual investigation required",
+        "error.$": "$.error"
+      },
+      "End": true
+    }
+  }
+}
